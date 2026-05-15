@@ -1,168 +1,259 @@
 const express = require('express');
 const axios = require('axios');
-const { CookieJar } = require('tough-cookie');
+const cors = require('cors');
 const cheerio = require('cheerio');
-const { JSDOM } = require('jsdom');
-const { URL } = require('url');
 
 const app = express();
-const PORT = 3000;
+app.use(cors());
 
-// Initialize cookie jar properly
- 
-// Configure axios instance with cookie support
-const axiosInstance = axios.create({
-  headers: {
-    'authority': 'gojo.wtf',
-    'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-    'accept-encoding': 'gzip, deflate, br',
-    'accept-language': 'en-US,en;q=0.9',
-    'cache-control': 'no-cache',
-    'dnt': '1',
-    'pragma': 'no-cache',
-    'referer': 'https://www.google.com/',
-    'sec-ch-ua': '"Chromium";v="118", "Google Chrome";v="118", "Not=A?Brand";v="99"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'sec-fetch-dest': 'document',
-    'sec-fetch-mode': 'navigate',
-    'sec-fetch-site': 'same-origin',
-    'sec-fetch-user': '?1',
-    'upgrade-insecure-requests': '1',
-    'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36'
-  },
-  jar: cookieJar,
-  withCredentials: true,
-  maxRedirects: 5
-});
+const DECODE_MAP = {
+  "01":"9","08":"0","05":"=","0a":"2","0b":"3","0c":"4","07":"?","00":"8",
+  "5c":"d","0f":"7","5e":"f","17":"/","54":"l","09":"1","48":"p","4f":"w",
+  "0e":"6","5b":"c","5d":"e","0d":"5","53":"k","1e":"&","5a":"b","59":"a",
+  "4a":"r","4c":"t","4e":"v","57":"o","51":"i"
+};
 
-// Cookie jar for session persistence
-const cookieJar = new axios.CookieJar();
-
- 
-// Advanced URL pattern matcher
-const URL_PATTERNS = [
-  // Standard HLS patterns
-  /(?:file:|src:|url:)\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/gi,
-  /(?:hls|playlist)Url["']?:\s*["'](.*?\.m3u8.*?)["']/gi,
-  
-  // Encoded patterns
-  /(?:\\x2F|%2F)([a-zA-Z0-9_\-/]+\.m3u8\??[a-zA-Z0-9_\-&%=]*)/gi, 
-  /(?:\\u002F)(.+?\.m3u8)/gi,
-  
-  // Split URL patterns
-  /(?:['"])(https?:?\/\/(?:[^"'\\]|\\.)+?\.m3u8)/gi,
-  /(?:['"])(\/[^"'\\]+\/playlist\.m3u8)/gi,
-  
-  // JSON embedded patterns
-  /"url"\s*:\s*"([^"]+\.m3u8[^"]*)"/gi,
-  /"playlist_url"\s*:\s*"([^"]+\.m3u8[^"]*)"/gi
-];
-
-function extractM3U8Url(content, baseUrl) {
-  // Normalize content
-  const decodedContent = content
-    .replace(/\\x([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
-    .replace(/\\\//g, '/');
-
-  // Multi-stage extraction
-  for (const pattern of URL_PATTERNS) {
-    const matches = [...decodedContent.matchAll(pattern)];
-    for (const [_, url] of matches) {
-      try {
-        const cleanedUrl = url
-          .replace(/^["']+|["']+$/g, '')
-          .replace(/\\+/g, '');
-        
-        const finalUrl = new URL(cleanedUrl, baseUrl).href;
-        if (finalUrl.includes('.m3u8')) return finalUrl;
-      } catch (e) {
-        continue;
-      }
-    }
-  }
-
-  // Fallback: DOM-based extraction
-  const dom = new JSDOM(decodedContent);
-  const elements = dom.window.document.querySelectorAll('[src*="m3u8"], [data-src*="m3u8"]');
-  for (const element of elements) {
-    const src = element.src || element.getAttribute('data-src');
-    if (src) {
-      try {
-        return new URL(src, baseUrl).href;
-      } catch (e) {
-        continue;
-      }
-    }
-  }
-
-  return null;
+function decodeSourceUrl(encoded) {
+  let result = "";
+  encoded.replace("--", "").match(/.{1,2}/g)?.forEach(s => {
+    if (s in DECODE_MAP) result += DECODE_MAP[s];
+  });
+  return result;
 }
 
-async function fetchStreamUrl(watchUrl) {
-  try {
-    // Initial request with full browser emulation
-    const response = await axiosInstance.get(watchUrl, {
-      validateStatus: (status) => status >= 200 && status < 400
-    });
+const ALLANIME_BASE = "https://allanime.day";
+const ALLANIME_API  = "https://api.allanime.day/allanimeapi";
+const SKIP_SOURCES  = ["Ak", "Yt-mp4", "Vid-mp4", "Sl-mp4"];
 
-    const html = response.data;
-    const baseUrl = new URL(watchUrl).origin;
-
-    // First extraction attempt
-    let m3u8Url = extractM3U8Url(html, baseUrl);
-
-    // Second attempt: Script concatenation
-    if (!m3u8Url) {
-      const $ = cheerio.load(html);
-      let scriptContent = '';
-      $('script').each((i, el) => {
-        scriptContent += $(el).html() + ' ';
-      });
-      m3u8Url = extractM3U8Url(scriptContent, baseUrl);
-    }
-
-    // Third attempt: Iframe source check
-    if (!m3u8Url) {
-      const $ = cheerio.load(html);
-      const iframeSrc = $('iframe').attr('src');
-      if (iframeSrc) {
-        const iframeUrl = new URL(iframeSrc, baseUrl).href;
-        const iframeResponse = await axiosInstance.get(iframeUrl);
-        m3u8Url = extractM3U8Url(iframeResponse.data, iframeUrl);
-      }
-    }
-
-    if (!m3u8Url) throw new Error('M3U8 URL not found');
-    return m3u8Url;
-  } catch (error) {
-    throw new Error(`Failed to extract stream: ${error.message}`);
-  }
-}
-
-app.get('/scrape', async (req, res) => {
-  try {
-    const watchUrl = 'https://gojo.wtf/watch/185736?ep=1&provider=zaza&subType=sub';
-    const m3u8Url = await fetchStreamUrl(watchUrl);
+// GET / - API docs
+app.get('/', (req, res) => {
+  res.json({
+    name: "🎌 Anime Scraper API",
+    version: "1.0.0",
+    endpoints: [
+      {
+        method: "GET",
+        path: "/details/:animeId",
+        description: "Get anime info and full episode list",
+        example: "http://localhost:3000/details/ReooPAxPMsHM4KPMY",
+        returns: "{ animeId, name, thumbnail, total, episodes[] }"
+      },
+      {
+        method: "GET",
+        path: "/sources/:episodeId",
+        description: "Get all video sources for an episode",
+        example: "http://localhost:3000/sources/ReooPAxPMsHM4KPMY&episode=1&type=sub",
+        returns: "{ animeId, episode, type, videos[] }"
+      },
+      {
+  method: "GET",
+  path: "/recent",
+  description: "Browse anime list from AllanimeAPI",
+  example: "/recent?page=1&type=dub",
+  returns: "{ page, type, total, animes[] }"
+},
+    ],
+    usage: {
+      step1: "GET /details/:animeId    → get episode list",
+      step2: "GET /sources/:episodeId  → get video sources"
+    },
     
-    // Validate and fetch final playlist
-    const m3u8Response = await axiosInstance.get(m3u8Url);
-    res.type('application/vnd.apple.mpegurl').send(m3u8Response.data);
-  } catch (error) {
-    res.status(500).json({
-      error: error.message,
-      possibleReasons: [
-        'Cloudflare protection triggered',
-        'Session cookies invalidated',
-        'Dynamic URL generation not handled',
-        'Anti-bot measures detected'
-      ]
+    examples: {
+      details: "http://localhost:3000/details/ReooPAxPMsHM4KPMY",
+      sources: "http://localhost:3000/sources/ReooPAxPMsHM4KPMY&episode=1&type=sub"
+    }
+  });
+});
+
+// GET /details/:animeId
+app.get('/details/:animeId', async (req, res) => {
+  const { animeId } = req.params;
+
+  try {
+    const { data } = await axios.get(ALLANIME_API, {
+      params: {
+        variables: JSON.stringify({ _id: animeId }),
+        extensions: JSON.stringify({
+          persistedQuery: {
+            sha256Hash: "043448386c7a686bc2aabfbb6b80f6074e795d350df48015023b079527b0848a",
+            version: 1
+          }
+        })
+      },
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114.0.0.0 Safari/537.36',
+        'Origin': 'https://allanime.to',
+        'Referer': 'https://allanime.to/',
+      }
     });
+
+    const show = data?.data?.show;
+    if (!show) return res.status(404).json({ error: 'Anime not found', raw: data });
+
+    const { availableEpisodesDetail, name, thumbnail, _id } = show;
+    const episodes = [];
+
+    ['sub', 'dub', 'raw'].forEach(type => {
+      (availableEpisodesDetail?.[type] || []).forEach(ep => {
+        const episodeId = `${_id}&episode=${ep}&type=${type}`;
+        episodes.push({
+          episodeId,
+          episode: ep,
+          type,
+          label: `${type} Episode ${ep}`,
+          videoUrl: `http://localhost:3000/sources/${episodeId}`
+        });
+      });
+    });
+
+    episodes.sort((a, b) => parseFloat(a.episode) - parseFloat(b.episode));
+
+    res.json({ animeId: _id, name, thumbnail, total: episodes.length, episodes });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  console.log('Request headers configured:');
-  console.dir(headers, { depth: null });
+// GET /browse?page=1&type=sub
+app.get('/recent', async (req, res) => {
+  const { page = 1, type = 'sub' } = req.query;
+
+  try {
+    const { data } = await axios.get(ALLANIME_API, {
+      params: {
+        variables: JSON.stringify({
+          translationType: type,
+          countryOrigin: 'ALL',
+          search: {},
+          limit: 26,
+          page: parseInt(page)
+        }),
+        extensions: JSON.stringify({
+          persistedQuery: {
+            sha256Hash: "a24c500a1b765c68ae1d8dd85174931f661c71369c89b92b88b75a725afc471c",
+            version: 1
+          }
+        })
+      },
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114.0.0.0 Safari/537.36',
+        'Origin': 'https://allanime.to',
+        'Referer': 'https://allanime.to/',
+      }
+    });
+
+    const shows = data?.data?.shows?.edges || [];
+
+    const animes = shows.map(show => ({
+      animeId: show._id,
+      title: show.name,
+      image: show.thumbnail?.startsWith('http')
+        ? show.thumbnail
+        : `https://wp.youtube-anime.com/aln.youtube-anime.com/${show.thumbnail}`,
+      genres: show.genres || [],
+      score: show.score || null,
+      availableEpisodes: show.availableEpisodes || {},
+      detailsUrl: `http://localhost:3000/details/${show._id}`
+    }));
+
+    res.json({
+      page: parseInt(page),
+      type,
+      total: animes.length,
+      animes
+    });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message, raw: err.response?.data });
+  }
+});
+// GET /sources/:episodeId  (e.g. ReooPAxPMsHM4KPMY&episode=1&type=sub)
+app.get('/sources/:episodeId', async (req, res) => {
+  const raw = req.params.episodeId;
+  const match = raw.match(/^(.+?)&episode=(.+?)&type=(.+)$/);
+  if (!match) return res.status(400).json({
+    error: 'Invalid episodeId format',
+    expected: 'animeId&episode=1&type=sub',
+    example: '/sources/ReooPAxPMsHM4KPMY&episode=1&type=sub'
+  });
+
+  const [, animeId, episode, type] = match;
+
+  try {
+    const { data } = await axios.get(ALLANIME_API, {
+      params: {
+        variables: JSON.stringify({ showId: animeId, episodeString: episode, translationType: type }),
+        extensions: JSON.stringify({
+          persistedQuery: {
+            sha256Hash: "d405d0edd690624b66baba3068e0edc3ac90f1597d898a1ec8db4e5c43c00fec",
+            version: 1
+          }
+        })
+      },
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114.0.0.0 Safari/537.36',
+        'Origin': 'https://allanime.to',
+        'Referer': 'https://allanime.to/',
+      }
+    });
+
+    const episodeData = data?.data?.episode;
+    if (!episodeData) return res.status(404).json({ error: 'Episode not found' });
+
+    const clockUrls = [];
+    const videos = [];
+
+    episodeData.sourceUrls?.forEach(p => {
+      if (SKIP_SOURCES.includes(p.sourceName)) return;
+      if (p.sourceUrl.startsWith("--")) {
+        let decoded = decodeSourceUrl(p.sourceUrl).replace("clock", "clock.json");
+        if (decoded.startsWith("/")) decoded = `${ALLANIME_BASE}${decoded}`;
+        clockUrls.push({ name: p.sourceName, url: decoded });
+      } else if (!p.sourceUrl.startsWith("#")) {
+        videos.push({ name: p.sourceName, source: p.sourceUrl, videoType: p.type !== "player" ? "iframe" : "mp4" });
+      }
+    });
+
+    const clockResults = await Promise.all(
+      clockUrls.map(async ({ name, url }) => {
+        try {
+          const r = await axios.get(url, {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/114.0.0.0 Safari/537.36',
+              'Referer': 'https://allanime.to/',
+              'Origin': 'https://allanime.to',
+            }
+          });
+          return { name, data: r.data };
+        } catch (e) {
+          return { name, error: e.message };
+        }
+      })
+    );
+
+    clockResults.forEach(({ name, data: clockData }) => {
+      if (!clockData?.links) return;
+      clockData.links.forEach(v => {
+        const src = v?.src ?? v?.link;
+        if (!src) return;
+        videos.push({
+          name: `${name} - ${new URL(src).hostname}`,
+          source: src,
+          videoType: v.hls ? "m3u8" : "mp4",
+          headers: v.headers || {}
+        });
+      });
+    });
+
+    res.json({ animeId, episode, type, videos });
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.listen(3000, () => {
+  console.log('🎌 Anime Scraper API running on http://localhost:3000');
+  console.log('📖 Docs: http://localhost:3000/');
 });

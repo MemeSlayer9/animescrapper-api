@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Manga Scraper Test</title>
+</head>
+<body>
+    <h1>Manga Scraper</h1>
+    
+    <input type="text" id="urlInput" placeholder="Enter manga URL" style="width: 400px;">
+    <input type="text" id="outputDir" placeholder="Output directory (optional)" style="width: 200px;">
+    <button onclick="scrapeAndDownload()">Scrape & Download</button>
+    
+    <pre id="result"></pre>
+
+    <script>
+        async function scrapeAndDownload() {
+            const url = document.getElementById('urlInput').value;
+            const outputDir = document.getElementById('outputDir').value || './downloads';
+            
+            document.getElementById('result').textContent = 'Loading...';
+            
+            try {
+                const response = await fetch('http://localhost:3000/scrape-download', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ url, outputDir })
+                });
+                
+                const data = await response.json();
+                document.getElementById('result').textContent = JSON.stringify(data, null, 2);
+            } catch (error) {
+                document.getElementById('result').textContent = 'Error: ' + error.message;
+            }
+        }
+    </script>
+</body>
+</html>

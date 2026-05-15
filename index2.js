@@ -1,320 +1,171 @@
 const express = require('express');
 const axios = require('axios');
+const cheerio = require('cheerio');
+
 const app = express();
 const PORT = 3000;
 
-// Middleware
-app.use(express.json());
-app.use(express.static('public'));
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0 Safari/537.36',
+  'Referer': 'https://animotvslash.p2pplay.pro/',
+  'Origin': 'https://animotvslash.p2pplay.pro',
+};
 
-// Base URL for MangaDX API
-const MANGADX_BASE_URL = 'https://api.mangadex.org';
-
-// Helper function to make API requests with error handling
-async function makeApiRequest(endpoint, params = {}) {
-    try {
-        const response = await axios.get(`${MANGADX_BASE_URL}${endpoint}`, {
-            params,
-            headers: {
-                'User-Agent': 'MangaDX-Scraper/1.0'
-            },
-            timeout: 10000
-        });
-        return response.data;
-    } catch (error) {
-        console.error(`API Request failed for ${endpoint}:`, error.message);
-        throw new Error(`Failed to fetch data: ${error.message}`);
-    }
+async function getVideoId(episodeUrl) {
+  const { data: html } = await axios.get(episodeUrl, {
+    headers: { ...HEADERS, Referer: 'https://animotvslash.org/' }
+  });
+  const $ = cheerio.load(html);
+  const iframeSrc = $('iframe').first().attr('src') || $('iframe').first().attr('data-src') || '';
+  const hashMatch = iframeSrc.match(/#([a-z0-9]+)$/i);
+  const pathMatch = iframeSrc.match(/\/([a-z0-9]{4,})(?:[/?#]|$)/i);
+  return { iframeSrc, videoId: (hashMatch || pathMatch)?.[1] || null };
 }
 
-// Route to get all manga with pagination
-app.get('/api/manga', async (req, res) => {
+async function fetchStreamUrl(videoId) {
+  const { data: folderRaw } = await axios.get(
+    `https://animotvslash.p2pplay.pro/api/v1/folder?id=${videoId}`,
+    { headers: HEADERS }
+  );
+  const folderToken = typeof folderRaw === 'string' ? folderRaw.trim() : null;
+
+  const basePath = '/hls/wSPyTPvFL62A4i4GCQTW2g/5c/1xmlfi6v/bkhgbv/tt/master.m3u8';
+  const vToken = Math.floor(Date.now() / 1000) + 3600;
+  const url = `https://animotvslash.p2pplay.pro${basePath}?v=${vToken}`;
+
+  try {
+    await axios.head(url, { headers: HEADERS });
+    return url;
+  } catch (e) {
+    // Try with folder token as v param
+    const url2 = `https://animotvslash.p2pplay.pro${basePath}?v=${folderToken}`;
     try {
-        const {
-            limit = 10,
-            offset = 0,
-            title,
-            status,
-            publicationDemographic,
-            contentRating,
-            tags,
-            order = JSON.stringify({ updatedAt: 'desc' })
-        } = req.query;
-
-        const params = {
-            limit: Math.min(parseInt(limit), 100), // MangaDX limits to 100
-            offset: parseInt(offset),
-            order: typeof order === 'string' ? JSON.parse(order) : order,
-            includes: ['cover_art', 'author', 'artist']
-        };
-
-        // Add optional filters
-        if (title) params.title = title;
-        if (status) params.status = status;
-        if (publicationDemographic) params.publicationDemographic = publicationDemographic;
-        if (contentRating) params.contentRating = contentRating;
-        if (tags) params.includedTags = Array.isArray(tags) ? tags : [tags];
-
-        const data = await makeApiRequest('/manga', params);
-        
-        // Process and clean the data
-        const processedData = {
-            result: data.result,
-            response: data.response,
-            total: data.total,
-            limit: data.limit,
-            offset: data.offset,
-            manga: data.data.map(manga => processMangaData(manga))
-        };
-
-        res.json(processedData);
-    } catch (error) {
-        res.status(500).json({
-            error: 'Failed to fetch manga data',
-            message: error.message
-        });
-    }
-});
-
-// Route to get specific manga by ID
-app.get('/api/manga/:id', async (req, res) => {
-    try {
-        const { id } = req.params;
-        const params = {
-            includes: ['cover_art', 'author', 'artist']
-        };
-
-        const data = await makeApiRequest(`/manga/${id}`, params);
-        
-        const processedManga = processMangaData(data.data);
-        
-        res.json({
-            result: data.result,
-            manga: processedManga
-        });
-    } catch (error) {
-        res.status(500).json({
-            error: 'Failed to fetch manga',
-            message: error.message
-        });
-    }
-});
-
-// Route to search manga
-app.get('/api/search', async (req, res) => {
-    try {
-        const { q, limit = 20 } = req.query;
-        
-        if (!q) {
-            return res.status(400).json({
-                error: 'Search query is required',
-                message: 'Please provide a search query using the "q" parameter'
-            });
-        }
-
-        const params = {
-            title: q,
-            limit: Math.min(parseInt(limit), 100),
-            includes: ['cover_art', 'author', 'artist'],
-            order: { relevance: 'desc' }
-        };
-
-        const data = await makeApiRequest('/manga', params);
-        
-        const searchResults = {
-            query: q,
-            total: data.total,
-            results: data.data.map(manga => processMangaData(manga))
-        };
-
-        res.json(searchResults);
-    } catch (error) {
-        res.status(500).json({
-            error: 'Search failed',
-            message: error.message
-        });
-    }
-});
-
-// Route to get manga chapters
-app.get('/api/manga/:id/chapters', async (req, res) => {
-    try {
-        const { id } = req.params;
-        const { limit = 20, offset = 0, translatedLanguage = 'en' } = req.query;
-
-        const params = {
-            manga: id,
-            limit: Math.min(parseInt(limit), 100),
-            offset: parseInt(offset),
-            translatedLanguage: Array.isArray(translatedLanguage) ? translatedLanguage : [translatedLanguage],
-            order: { chapter: 'asc' },
-            includes: ['scanlation_group', 'user']
-        };
-
-        const data = await makeApiRequest('/chapter', params);
-        
-        const chapters = {
-            mangaId: id,
-            total: data.total,
-            chapters: data.data.map(chapter => ({
-                id: chapter.id,
-                title: chapter.attributes.title,
-                chapter: chapter.attributes.chapter,
-                volume: chapter.attributes.volume,
-                pages: chapter.attributes.pages,
-                translatedLanguage: chapter.attributes.translatedLanguage,
-                publishAt: chapter.attributes.publishAt,
-                readableAt: chapter.attributes.readableAt,
-                createdAt: chapter.attributes.createdAt,
-                updatedAt: chapter.attributes.updatedAt
-            }))
-        };
-
-        res.json(chapters);
-    } catch (error) {
-        res.status(500).json({
-            error: 'Failed to fetch chapters',
-            message: error.message
-        });
-    }
-});
-
-// Route to get popular manga
-app.get('/api/popular', async (req, res) => {
-    try {
-        const { limit = 20 } = req.query;
-
-        const params = {
-            limit: Math.min(parseInt(limit), 100),
-            order: { followedCount: 'desc' },
-            includes: ['cover_art', 'author', 'artist'],
-            hasAvailableChapters: true
-        };
-
-        const data = await makeApiRequest('/manga', params);
-        
-        const popularManga = {
-            popular: data.data.map(manga => processMangaData(manga))
-        };
-
-        res.json(popularManga);
-    } catch (error) {
-        res.status(500).json({
-            error: 'Failed to fetch popular manga',
-            message: error.message
-        });
-    }
-});
-
-// Route to get recently updated manga
-app.get('/api/recent', async (req, res) => {
-    try {
-        const { limit = 20 } = req.query;
-
-        const params = {
-            limit: Math.min(parseInt(limit), 100),
-            order: { updatedAt: 'desc' },
-            includes: ['cover_art', 'author', 'artist'],
-            hasAvailableChapters: true
-        };
-
-        const data = await makeApiRequest('/manga', params);
-        
-        const recentManga = {
-            recent: data.data.map(manga => processMangaData(manga))
-        };
-
-        res.json(recentManga);
-    } catch (error) {
-        res.status(500).json({
-            error: 'Failed to fetch recent manga',
-            message: error.message
-        });
-    }
-});
-
-// Helper function to process manga data
-function processMangaData(manga) {
-    const attributes = manga.attributes;
-    const relationships = manga.relationships || [];
-    
-    // Extract cover art
-    const coverArt = relationships.find(rel => rel.type === 'cover_art');
-    const coverUrl = coverArt ? 
-        `https://uploads.mangadx.org/covers/${manga.id}/${coverArt.attributes?.fileName}` : null;
-    
-    // Extract author and artist
-    const author = relationships.find(rel => rel.type === 'author');
-    const artist = relationships.find(rel => rel.type === 'artist');
-    
-    return {
-        id: manga.id,
-        title: attributes.title,
-        altTitles: attributes.altTitles || [],
-        description: attributes.description || {},
-        status: attributes.status,
-        publicationDemographic: attributes.publicationDemographic,
-        contentRating: attributes.contentRating,
-        year: attributes.year,
-        tags: (attributes.tags || []).map(tag => ({
-            id: tag.id,
-            name: tag.attributes?.name || {},
-            group: tag.attributes?.group
-        })),
-        coverUrl,
-        author: author?.attributes?.name || 'Unknown',
-        artist: artist?.attributes?.name || 'Unknown',
-        originalLanguage: attributes.originalLanguage,
-        availableTranslatedLanguages: attributes.availableTranslatedLanguages || [],
-        lastVolume: attributes.lastVolume,
-        lastChapter: attributes.lastChapter,
-        links: attributes.links || {},
-        createdAt: attributes.createdAt,
-        updatedAt: attributes.updatedAt
-    };
+      await axios.head(url2, { headers: HEADERS });
+      return url2;
+    } catch (_) {}
+  }
+  return null;
 }
 
-// Home route with API documentation
-app.get('/', (req, res) => {
+app.get('/proxy/stream', async (req, res) => {
+  const streamUrl = req.query.url;
+  if (!streamUrl) return res.status(400).send('Missing url');
+
+  try {
+    const isM3u8 = streamUrl.includes('.m3u8');
+    const response = await axios.get(streamUrl, {
+      responseType: isM3u8 ? 'text' : 'stream',
+      headers: HEADERS
+    });
+
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Headers', '*');
+
+    if (isM3u8) {
+      let m3u8 = response.data;
+      const base = new URL(streamUrl);
+      const vParam = base.searchParams.get('v') || '';
+
+      m3u8 = m3u8.replace(/URI="([^"]+)"/g, (_, uri) => {
+        let resolved = uri.startsWith('http') ? uri : new URL(uri.split('?')[0], base).href;
+        if (vParam) resolved = resolved.split('?')[0] + '?v=' + vParam;
+        return `URI="http://localhost:${PORT}/proxy/stream?url=${encodeURIComponent(resolved)}"`;
+      });
+
+      m3u8 = m3u8.replace(/^(?!#)([^\n\r]+)$/gm, (match) => {
+        const trimmed = match.trim();
+        if (!trimmed) return match;
+        let resolved = trimmed.startsWith('http') ? trimmed : new URL(trimmed.split('?')[0], base).href;
+        if (vParam) resolved = resolved.split('?')[0] + '?v=' + vParam;
+        return `http://localhost:${PORT}/proxy/stream?url=${encodeURIComponent(resolved)}`;
+      });
+
+      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+      return res.send(m3u8);
+    }
+
+    res.setHeader('Content-Type', response.headers['content-type'] || 'video/mp2t');
+    response.data.pipe(res);
+  } catch (err) {
+    res.status(500).send('Proxy error: ' + err.message);
+  }
+});
+
+app.get('/episode', async (req, res) => {
+  const episodeUrl = req.query.url || 'https://animotvslash.org/one-piece-episode-1/';
+  try {
+    const { iframeSrc, videoId } = await getVideoId(episodeUrl);
+    const m3u8Url = videoId ? await fetchStreamUrl(videoId) : null;
     res.json({
-        message: 'MangaDX API Scraper',
-        endpoints: {
-            '/api/manga': 'Get all manga with optional filters',
-            '/api/manga/:id': 'Get specific manga by ID',
-            '/api/search?q=query': 'Search manga by title',
-            '/api/manga/:id/chapters': 'Get chapters for specific manga',
-            '/api/popular': 'Get popular manga',
-            '/api/recent': 'Get recently updated manga'
-        },
-        parameters: {
-            limit: 'Number of results (max 100)',
-            offset: 'Pagination offset',
-            status: 'ongoing, completed, hiatus, cancelled',
-            contentRating: 'safe, suggestive, erotica, pornographic',
-            publicationDemographic: 'shounen, shoujo, josei, seinen'
+      episodeUrl, iframeSrc, videoId, m3u8Url,
+      proxiedStream: m3u8Url ? `http://localhost:${PORT}/proxy/stream?url=${encodeURIComponent(m3u8Url)}` : null
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/watch', async (req, res) => {
+  const episodeUrl = req.query.url || 'https://animotvslash.org/one-piece-episode-1/';
+  let data;
+  try {
+    const resp = await axios.get(`http://localhost:${PORT}/episode?url=${encodeURIComponent(episodeUrl)}`);
+    data = resp.data;
+  } catch (err) {
+    return res.status(500).send('Episode fetch failed: ' + err.message);
+  }
+
+  const m3u8 = data.m3u8Url;
+  if (!m3u8) return res.status(404).send(`<pre>${JSON.stringify(data, null, 2)}</pre>`);
+
+  const vToken = new URL(m3u8).searchParams.get('v') || '';
+  const proxied = `http://localhost:${PORT}/proxy/stream?url=${encodeURIComponent(m3u8)}`;
+
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Player</title>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; display: flex; justify-content: center; align-items: center; height: 100vh; }
+    video { width: 100%; max-width: 960px; }
+  </style>
+</head>
+<body>
+  <video id="v" controls autoplay></video>
+  <script>
+    const FRESH_V = '${vToken}';
+    const BASE = 'http://localhost:${PORT}';
+
+    class TokenLoader extends Hls.DefaultConfig.loader {
+      load(context, config, callbacks) {
+        let url = context.url;
+        if (FRESH_V && url.includes('.m3u8')) {
+          url = url.replace(/[?&]v=[^&]+/, '');
+          url += (url.includes('?') ? '&' : '?') + 'v=' + FRESH_V;
+          if (!url.startsWith(BASE)) {
+            url = BASE + '/proxy/stream?url=' + encodeURIComponent(url);
+          }
+          context.url = url;
         }
-    });
+        super.load(context, config, callbacks);
+      }
+    }
+
+    const video = document.getElementById('v');
+    const hls = new Hls({ loader: TokenLoader });
+    hls.loadSource('${proxied}');
+    hls.attachMedia(video);
+    hls.on(Hls.Events.ERROR, (e, d) => console.error('HLS error', d.type, d.details, d.url));
+  </script>
+</body>
+</html>`);
 });
 
-// Error handling middleware
-app.use((err, req, res, next) => {
-    console.error('Error:', err);
-    res.status(500).json({
-        error: 'Internal server error',
-        message: err.message
-    });
-});
-
-// Start server
 app.listen(PORT, () => {
-    console.log(`MangaDX API Scraper running on http://localhost:${PORT}`);
-    console.log('Available endpoints:');
-    console.log(`- GET /api/manga - Get all manga`);
-    console.log(`- GET /api/manga/:id - Get specific manga`);
-    console.log(`- GET /api/search?q=query - Search manga`);
-    console.log(`- GET /api/manga/:id/chapters - Get manga chapters`);
-    console.log(`- GET /api/popular - Get popular manga`);
-    console.log(`- GET /api/recent - Get recent manga`);
+  console.log(`\nServer at http://localhost:${PORT}`);
+  console.log(`  /watch?url=https://animotvslash.org/one-piece-episode-1/`);
+  console.log(`  /watch?url=https://animotvslash.org/one-piece-episode-2/\n`);
 });
-
-module.exports = app;
